@@ -1,4 +1,4 @@
-name: Build
+Name: Build
 
 # https://docs.github.com/en/actions/learn-github-actions/workflow-syntax-for-github-actions#concurrency
 concurrency: 
@@ -30,7 +30,7 @@ jobs:
           path: "builds"
       
       - name: Clean old builds
-        run: rm $GITHUB_WORKSPACE/builds/*.cs3
+        run: rm -f $GITHUB_WORKSPACE/builds/*.cs3
 
       - name: Setup JDK 17
         uses: actions/setup-java@v1
