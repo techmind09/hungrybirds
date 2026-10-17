@@ -1,91 +1,79 @@
-name: Build extensions
+name: Build
+
+# https://docs.github.com/en/actions/learn-github-actions/workflow-syntax-for-github-actions#concurrency
+concurrency:
+  group: "build"
+  cancel-in-progress: true
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    branches:
+      # choose your default branch
+      - master
+      - main
+    paths-ignore:
+      - "*.md"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          distribution: temurin
+          path: "src"
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
           java-version: 17
+          distribution: "temurin"
+          cache: gradle
 
-      - name: Cache kotlinc
-        uses: actions/cache@v4
-        with:
-          path: kotlinc
-          key: kotlinc-2.4.10
 
-      - name: Build all extensions + repo.json
+      - name: Build Plugins and prepare artifacts
         run: |
-          set -o pipefail
-          bash build.sh > build.log 2>&1
-          code=$?
-          echo "build exit code = $code"
-          if [ $code -ne 0 ]; then
-            echo "==== TAIL OF BUILD LOG ===="
-            tail -n 150 build.log
-            echo "==== KOTLIN ERRORS ===="
-            grep -E "^e: " build.log | head -n 40 || true
-            echo "==== KOTLINC/GRADLE ERRORS ===="
-            grep -E "error:|exception|FAILURE" build.log | head -n 40 || true
-          fi
-          exit $code
+          cd $GITHUB_WORKSPACE/src
+          chmod +x gradlew
+          ./gradlew --build-cache make makePluginsJson
+          mkdir -p $GITHUB_WORKSPACE/builds
+          cp **/build/*.cs3 $GITHUB_WORKSPACE/builds
+          cp build/plugins.json $GITHUB_WORKSPACE/builds
+          sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
+          # Create versioned cs3 filenames per plugin and rewrite URLs in plugins.json
+          PLUGINS_JSON="$GITHUB_WORKSPACE/builds/plugins.json"
+          TMP_JSON="$GITHUB_WORKSPACE/builds/plugins.tmp.json"
+          while IFS= read -r row; do
+            NAME=$(echo "$row" | jq -r '.internalName')
+            VER=$(echo "$row" | jq -r '.version')
+            SRC="$GITHUB_WORKSPACE/builds/${NAME}.cs3"
+            DST="$GITHUB_WORKSPACE/builds/${NAME}-v${VER}.cs3"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "$DST"
+            fi
+          done < <(jq -c '.[]' "$PLUGINS_JSON")
+
+          jq --arg repo "$GITHUB_REPOSITORY" \
+            'map(.url = "https://raw.githubusercontent.com/\($repo)/builds/" + .internalName + "-v" + (.version|tostring) + ".cs3")' \
+            "$PLUGINS_JSON" > "$TMP_JSON" && mv "$TMP_JSON" "$PLUGINS_JSON"
+
+          SHORT_SHA=${GITHUB_SHA:0:8}
+          cp build/plugins.json $GITHUB_WORKSPACE/builds/plugins-${SHORT_SHA}.json
+          jq -n \
+            --arg name "Cartoony Repo" \
+            --arg desc "Arabic Cartoony provider" \
+            --arg url "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/builds/plugins-${SHORT_SHA}.json" \
+            '{name: $name, description: $desc, manifestVersion: 1, pluginLists: [$url]}' \
+            > $GITHUB_WORKSPACE/builds/repo.json
+
+      - name: Deploy to builds branch
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          name: build-log
-          path: build.log
-          if-no-files-found: ignore
-
-      - name: Upload artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hiki
-          path: |
-            *.hiki
-            *.jar
-            native-cs3/*.cs3
-            repo.json
-            repo-desktop.json
-          if-no-files-found: error
-
-      - name: Publish to continuous release
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if gh release view continuous --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload continuous *.hiki *.jar native-cs3/*.cs3 repo.json repo-desktop.json --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create continuous *.hiki *.jar native-cs3/*.cs3 repo.json repo-desktop.json --repo "$GITHUB_REPOSITORY" \
-              --title "Continuous build" \
-              --notes "Hikari extensions + repo.json, auto-built from main." || true
-          fi
-
-      - name: Publish repo.json to builds branch
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cp repo.json /tmp/repo.json
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin builds >/dev/null 2>&1 && git checkout builds 2>/dev/null || git checkout --orphan builds
-          cp /tmp/repo.json repo.json
-          cp repo-desktop.json /tmp/repo-desktop.json
-          git add repo.json
-          git commit -m "repo: update repo.json $(date -u +%Y%m%d%H%M)" || true
-          git push origin builds --force
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: builds
+          publish_dir: builds
+          force_orphan: true
+          user_name: "github-actions[bot]"
+          user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_message: Build ${{ github.sha }}
